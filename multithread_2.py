@@ -1,0 +1,505 @@
+#%% Load modules
+from IPython import get_ipython
+import numpy as np
+import socket
+import sys
+import json
+import re
+import matplotlib.pyplot as plt
+
+
+import cv2
+import requests
+
+import pygame
+import os
+
+import logging
+import threading
+from datetime import datetime
+from tkinter import *
+from tkinter.ttk import *
+from urllib.request import urlopen
+import time
+'''
+INFO SECTION
+- if you want to monitor raw parameters of ESP32CAM, open the browser and go to http://192.168.x.x/status
+- command can be sent through an HTTP get composed in the following way http://192.168.x.x/control?var=VARIABLE_NAME&val=VALUE (check varname and value in status)
+'''
+#%% Clear working space
+plt.close('all')
+
+cmd_no = 0
+stopped = False
+cur_dis = 0;
+#%% Stream thread function
+def stream_function(name):
+    logging.info("Thread %s: starting", name)
+    # ESP32 URL
+    URL = "http://192.168.4.1"
+    AWB = True
+    cap = cv2.VideoCapture(URL + ":81/stream")
+   
+    while True:
+        
+        if cap.isOpened():
+            ret, frame = cap.read()
+
+            if ret:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.equalizeHist(gray)
+
+
+            min_blob_size = 1000
+            height, width, _ = frame.shape
+            
+            #Define the region of interest (bottom two-thirds of the image)
+            roi_top = height // 3
+            roi_bottom = height
+            
+            
+            # Convert frame to HSV color space (better for color segmentation)
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+            # Define lower and upper bounds for blue, green, and red in HSV color space
+            lower_blue = np.array([100, 50, 50])
+            upper_blue = np.array([130, 255, 255])
+        
+            lower_green = np.array([40, 50, 50])
+            upper_green = np.array([80, 255, 255])
+        
+            lower_red1 = np.array([0, 50, 50])
+            upper_red1 = np.array([10, 255, 255])
+            lower_red2 = np.array([170, 50, 50])
+            upper_red2 = np.array([180, 255, 255])
+        
+            # Threshold the HSV frame to get only blue, green, and red areas
+            mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+            mask_green = cv2.inRange(hsv, lower_green, upper_green)
+            mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+            mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        
+        
+            # Crop masks to the region of interest
+            roi_mask = np.zeros_like(mask_blue)
+            roi_mask[roi_top:roi_bottom, :] = 255
+            
+            mask_blue = cv2.bitwise_and(mask_blue, roi_mask)
+            mask_green = cv2.bitwise_and(mask_green, roi_mask)
+            mask_red = cv2.bitwise_and(mask_red, roi_mask)
+            # Find contours in the masks
+            contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+            # Function to filter contours based on minimum size
+            def filter_contours(contours, min_size):
+                filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_size]
+                return filtered_contours
+        
+            # Filter contours by size
+            contours_blue = filter_contours(contours_blue, min_blob_size)
+            contours_green = filter_contours(contours_green, min_blob_size)
+            contours_red = filter_contours(contours_red, min_blob_size)
+        
+            # Draw bounding boxes around the blobs
+            def draw_bounding_boxes(frame, contours, color, label):
+                for cnt in contours:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Draw bounding boxes only if there are contours found
+            if contours_blue:
+                draw_bounding_boxes(frame, contours_blue, (255, 0, 0), "Blue")  # Blue color
+            if contours_green:
+                draw_bounding_boxes(frame, contours_green, (0, 255, 0), "Green")  # Green color
+            if contours_red:
+                draw_bounding_boxes(frame, contours_red, (0, 0, 255), "Red")  # Red color
+           
+            cv2.imshow("frame", frame)
+            #cv2.imshow("frame", frame)
+
+            key = cv2.waitKey(1)
+            
+            if key == ord('r'):
+                idx = int(input("Select resolution index: "))
+                set_resolution(URL, index=idx, verbose=True)
+
+            elif key == ord('q'):
+                val = int(input("Set quality (10 - 63): "))
+                set_quality(URL, value=val)
+
+            elif key == ord('a'):
+                AWB = set_awb(URL, AWB)
+
+            elif key == 27:
+                break
+            
+    cv2.destroyAllWindows()
+    cap.release()
+    car.close()
+    os._exit(1)
+    
+    
+#%% Controller thread function
+def controller_function(name):
+    global stopped
+    global cur_dis
+    
+    min_dis = 20
+    last_time = round(time.time() * 1000)
+    count = 0
+    
+    
+    pygame.init()
+    running = True
+    LEFT, RIGHT, UP, DOWN = False, False, False, False
+    speed = 120
+    clock = pygame.time.Clock()
+    #Initialize controller
+    joysticks = []
+    
+    for i in range(pygame.joystick.get_count()):
+        joysticks.append(pygame.joystick.Joystick(i))
+    for joystick in joysticks:
+        joystick.init()
+
+    with open(os.path.join("ps4_keys.json"), 'r+') as file:
+        button_keys = json.load(file)
+    # 0: Left analog horizonal, 1: Left Analog Vertical, 2: Right Analog Horizontal
+    # 3: Right Analog Vertical 4: Left Trigger, 5: Right Trigger
+    analog_keys = {0:0, 1:0, 2:0, 3:0, 4:-1, 5: -1 }
+
+    analog_zero = True
+    prev_dir = ""
+    # START OF GAME LOOP
+    while running:
+        
+        ################################# CHECK PLAYER INPUT #################################
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                ############### UPDATE SPRITE IF SPACE IS PRESSED #################################
+                pass
+
+            # HANDLES BUTTON PRESSES
+            if event.type == pygame.JOYBUTTONDOWN:
+                if event.button == button_keys['left_arrow']:
+                    cmd(car, do = 'move_timed', where = 'left', at = speed)
+                if event.button == button_keys['right_arrow']:
+                    cmd(car, do = 'move_timed', where = 'right', at = speed)
+                if event.button == button_keys['down_arrow']:
+                    cmd(car, do = 'move_timed', where = 'back', at = speed)
+                if event.button == button_keys['up_arrow']:
+                    if(not stopped):
+                        cmd(car, do = 'move_timed', where = 'forward', at = speed)
+               #if event.button == button_keys['square']:
+                    #running = False
+                    #os._exit(1) 
+                
+                if event.button == button_keys['L1']:
+                    cmd(car, do = 'rotate', at = 180)
+                if event.button == button_keys['R1']:
+                    cmd(car, do = 'rotate', at = 0)
+                if event.button == button_keys['x']:
+                    cur_dis = cmd(car, do = "measure", what = "distance")
+ 
+            # HANDLES BUTTON RELEASES
+            if event.type == pygame.JOYBUTTONUP:
+                if event.button == button_keys['left_arrow']:
+                    LEFT = False
+                if event.button == button_keys['right_arrow']:
+                    RIGHT = False
+                if event.button == button_keys['down_arrow']:
+                    DOWN = False
+                if event.button == button_keys['up_arrow']:
+                    UP = False
+                if event.button == button_keys['L1']:
+                    cmd(car, do = 'rotate', at = 90)
+                if event.button == button_keys['R1']:
+                    cmd(car, do = 'rotate', at = 90)
+                
+                
+            #HANDLES ANALOG INPUTS
+            if event.type == pygame.JOYAXISMOTION:
+                analog_keys[event.axis] = event.value
+                #print(analog_keys)
+                
+                direction = ""
+                
+                # Horizontal Analog
+                if abs(analog_keys[0]) > .4:
+                    if analog_keys[0] < -.7:
+                        LEFT = True
+                        direction += "left"
+                    else:
+                        LEFT = False
+                    if analog_keys[0] > .7:
+                        RIGHT = True
+                        direction += "right"
+                    else:
+                        RIGHT = False
+                # Vertical Analog
+                if abs(analog_keys[1]) > .4:
+                    if analog_keys[1] < -.7:
+                        UP = True
+                        if(not stopped):
+                            direction += "forward"
+                    else:
+                        UP = False
+                    if analog_keys[1] > .7:
+                        #cmd(car, do = 'move', where = 'back', at = speed)
+                        DOWN = True
+                        direction += "back"
+                    else:
+                        DOWN = False                        
+                
+                if direction == "" and analog_zero == False:
+                    analog_zero = True;
+                    cmd(car, do = "move_analog", where="", )
+                if not direction == "" and not prev_dir == direction:
+                    print(direction)
+                    analog_zero = False;
+                    prev_dir = direction
+                    cmd(car, do = 'move_analog', where = direction, at = speed)
+           
+        
+        if (round(time.time() * 1000) - last_time) > 333:
+            cur_dis = cmd(car, do = "measure", what = "distance")
+            if(cur_dis <= min_dis):
+                if(not stopped):                   
+                    cmd(car, do = "stop")
+                    stopped = True
+                else:
+                    print("Something is {} units in front of the rover, move away!".format(cur_dis))
+            else:
+                stopped = False
+            #print(count)
+            #count = count + 1
+            last_time = round(time.time() * 1000)
+        
+        clock.tick(60)
+
+#%% ESP32 Cam Settings CMDs
+def set_resolution(url: str, index: int=1, verbose: bool=False):
+    try:
+        if verbose:
+            resolutions = "10: UXGA(1600x1200)\n9: SXGA(1280x1024)\n8: XGA(1024x768)\n7: SVGA(800x600)\n6: VGA(640x480)\n5: CIF(400x296)\n4: QVGA(320x240)\n3: HQVGA(240x176)\n0: QQVGA(160x120)"
+            print("available resolutions\n{}".format(resolutions))
+
+        if index in [10, 9, 8, 7, 6, 5, 4, 3, 0]:
+            requests.get(url + "/control?var=framesize&val={}".format(index))
+        else:
+            print("Wrong index")
+    except:
+        print("SET_RESOLUTION: something went wrong")
+
+def set_quality(url: str, value: int=1, verbose: bool=False):
+    try:
+        if value >= 10 and value <=63:
+            requests.get(url + "/control?var=quality&val={}".format(value))
+    except:
+        print("SET_QUALITY: something went wrong")
+
+def set_awb(url: str, awb: int=1):
+    try:
+        awb = not awb
+        requests.get(url + "/control?var=awb&val={}".format(1 if awb else 0))
+    except:
+        print("SET_QUALITY: something went wrong")
+    return awb
+
+
+#%% Send a command and receive a response
+off = [0.007,  0.022,  0.091,  0.012, -0.011, -0.05]
+def cmd(sock, do, what = '', where = '', at = ''):
+    global cmd_no
+    cmd_no += 1
+    msg = {"H":str(cmd_no)} # dictionary
+    if do == 'move':
+        msg["N"] = 3
+        what = ' car '
+        if where == 'forward':
+            msg["D1"] = 3
+        elif where == 'back':
+            msg["D1"] = 4
+            msg["T"] = 500
+        elif where == 'left':
+            msg["D1"] = 1
+        elif where == 'right':
+            msg["D1"] = 2
+        msg["D2"] = at # at is speed here
+        where = where + ' '
+    elif do == 'move_timed':
+        msg["N"] = 2
+        what = ' car '
+        if where == 'forward':
+            msg["D1"] = 3
+            msg["T"] = 500
+        elif where == 'back':
+            msg["D1"] = 4
+            msg["T"] = 500
+        elif where == 'left':
+            msg["D1"] = 1
+            msg["T"] = 260
+        elif where == 'right':
+            msg["D1"] = 2
+            msg["T"] = 260
+        msg["D2"] = at # at is speed here
+        where = where + ' '
+    elif do == 'move_analog':
+        msg["N"] = 102
+        what = ' car '
+        if where == 'forward':
+            msg["D1"] = 1
+        elif where == 'back':
+            msg["D1"] = 2
+        elif where == 'left':
+            msg["D1"] = 3
+        elif where == 'right':
+            msg["D1"] = 4
+        elif where == 'leftforward':
+            msg["D1"] = 5
+        elif where == 'rightback':
+            msg["D1"] = 6
+        elif where == 'rightforward':
+            msg["D1"] = 7
+        elif where == 'rightback':
+            msg["D1"] = 8
+        else:
+            msg["D1"] = 9
+        msg["D2"] = at # at is speed here
+        where = where + ' '
+    elif do == 'stop':
+        msg.update({"N":1,"D1":0,"D2":0,"D3":1})
+        what = ' car'
+    elif do == 'rotate':
+        msg.update({"N":5,"D1":1,"D2":at}) # at is an angle here
+        what = ' ultrasonic unit'
+        where = ' '    
+    elif do == 'measure':
+        if what == 'distance':
+            msg.update({"N":21,"D1":2})
+        elif what == 'motion':
+            msg["N"] = 6
+        what = ' ' + what
+    elif do == 'check':
+        msg["N"] = 23
+        what = ' off the ground'
+    msg_json = json.dumps(msg)
+    print(str(cmd_no) + ': ' + do + what + where + str(at), end = ': ')
+    try:
+        sock.send(msg_json.encode())
+    except:
+        print('Error: ', sys.exc_info()[0])
+        sys.exit()
+    while 1:
+        res = sock.recv(1024).decode()
+        
+        res = res.replace("{Heartbeat}", "")
+        print(res)
+        if '_' in res:
+            break
+    res = re.search('_(.*)}', res).group(1)
+    if res == 'ok' or res == 'true':
+        res = 1
+    elif res == 'false':
+        res = 0
+    #elif msg.get("N") == 5:
+    #    time.sleep(0.5)                     # give time to rotate head
+    elif msg.get("N") == 6:
+        res = res.split(",")
+        res = [int(x)/16384 for x in res] # convert to units of g
+        res[2] = res[2] - 1 # subtract 1G from az
+        res = [round(res[i] - off[i], 4) for i in range(6)]
+    elif msg.get("N") == 21:
+        res = round(int(res)*1.3, 1)        # UM distance with correction factor
+    else:
+        res = int(res)
+    print(res)
+    return res
+
+#%% Plot MPU data
+#ag = np.empty([0, 6])
+#ag_name = ['ax', 'ay', 'az', 'gx', 'gy', 'gz']
+#fig = plt.figure()
+#mgr = plt.get_current_fig_manager()
+#mgr.window.setGeometry(800, 30, 1120, 650) # x, y, dx, dy, valid only for Qt5
+
+#%% MPU Plot Update
+def plt_update(mot):
+    global ag
+    ag = np.vstack((ag, mot))
+    plt.clf()
+    for i in range(6):
+        plt.plot(ag[:,i], label = ag_name[i])
+    plt.legend(loc = 'upper left')
+    plt.pause(0.01)
+    plt.show()
+    
+#%% Connect to car's Wifi
+ip = "192.168.4.1"
+port = 100
+print('Connect to {0}:{1}'.format(ip, port))
+car = socket.socket()
+try:
+    car.connect((ip, port))
+except:
+    print('Error: ', sys.exc_info()[0])
+    sys.exit()
+print('Connected!')
+
+
+#%% Read first data from socket
+print('Receive from {0}:{1}'.format(ip, port))
+try:
+    data = car.recv(1024).decode()
+except:
+    print('Error: ', sys.exc_info()[0])
+    sys.exit()
+print('Received: ', data)
+
+#%% Buttons
+
+root = Tk()
+root.geometry('500x200')
+
+speed = 120
+
+servo_center_bt = Button(root, text = "Servo center!", command = lambda : cmd(car, do = 'rotate', at = 90))
+servo_center_bt.pack(side = 'top')
+servo_right_bt = Button(root, text = "Servo right!", command = lambda : cmd(car, do = 'rotate', at = 0))
+servo_right_bt.pack(side = 'right')
+servo_left_bt = Button(root, text = "Servo left!", command = lambda : cmd(car, do = 'rotate', at = 180))
+servo_left_bt.pack(side = 'left')
+
+servo_center_bt = Button(root, text = "Distance!", command = lambda : cmd(car, do = 'measure', what = 'distance'))
+servo_center_bt.pack(side = 'top')
+servo_right_bt = Button(root, text = "Go Forward!", command = lambda : cmd(car, do = 'move_timed', where = 'forward', at = speed))
+servo_right_bt.pack(side = 'top')
+servo_left_bt = Button(root, text = "Turn Right!", command = lambda : cmd(car, do = 'move_timed', where = 'right', at = speed))
+servo_left_bt.pack(side = 'right')
+servo_center_bt = Button(root, text = "Turn Left!", command = lambda : cmd(car, do = 'move_timed', where = 'left', at = speed))
+servo_center_bt.pack(side = 'left')
+servo_right_bt = Button(root, text = "Go backward!", command = lambda : cmd(car, do = 'move_timed', where = 'back', at = speed))
+servo_right_bt.pack(side = 'bottom')
+
+servo_right_bt = Button(root, text = "Stop!", command = lambda : cmd(car, do = 'stop'))
+servo_right_bt.pack(side = 'bottom')
+
+#%% Main
+if __name__ == '__main__':
+
+    x = threading.Thread(target = stream_function, args=(1,), daemon=False)
+    x.start()
+    y = threading.Thread(target = controller_function, args=(1,),daemon=False)
+    y.start()
+    
+    root.mainloop()
+
+    x.join()
+    y.join()
+
+    plt.close('all')
